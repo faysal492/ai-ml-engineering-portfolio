@@ -212,12 +212,18 @@ if prompt := st.chat_input("Ask me anything..."):
             full_response = ""
             
             # Stream response
-            for chunk in st.session_state.rag_engine.generate_response_streaming(
-                prompt, 
-                retrieved_chunks,
-                chat_history=st.session_state.messages[:-1]  # Exclude current user message
-            ):
-                full_response += chunk
+            try:
+                for chunk in st.session_state.rag_engine.generate_response_streaming(
+                    prompt, 
+                    retrieved_chunks,
+                    chat_history=st.session_state.messages[:-1]  # Exclude current user message
+                ):
+                    full_response += chunk
+                    response_placeholder.write(full_response)
+            except Exception as stream_error:
+                st.error(f"⚠️ LLM Error: {str(stream_error)[:200]}")
+                # Try with fallback response
+                full_response = f"I retrieved relevant information from your documents, but encountered an issue generating a response. Here's what I found in the sources:\n\n{retrieved_chunks[0]['metadata'].get('content', 'See sources below for more details.')}"
                 response_placeholder.write(full_response)
             
             # Display source citations
