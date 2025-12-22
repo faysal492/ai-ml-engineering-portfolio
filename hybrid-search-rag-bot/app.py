@@ -2,8 +2,13 @@ import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage
 from ingest import DocumentIngester
+from rag_engine import RAGEngine
 import os
 import json
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Page configuration
 st.set_page_config(
@@ -35,6 +40,9 @@ if "uploaded_documents" not in st.session_state:
 if "document_chunks" not in st.session_state:
     st.session_state.document_chunks = []
 
+if "rag_engine" not in st.session_state:
+    st.session_state.rag_engine = None
+
 # Initialize the document ingester
 ingester = DocumentIngester()
 
@@ -61,6 +69,27 @@ with st.sidebar:
     
     st.divider()
     
+    # Initialize RAG Engine if we have all required credentials
+    if st.session_state.groq_api_key and not st.session_state.rag_engine:
+        try:
+            pinecone_key = os.getenv("PINECONE_API_KEY") or st.secrets.get("PINECONE_API_KEY")
+            pinecone_env = os.getenv("PINECONE_ENVIRONMENT", "us-east-1-aws")
+            pinecone_index = os.getenv("PINECONE_INDEX_NAME", "rag-chatbot")
+            
+            if pinecone_key:
+                with st.spinner("Initializing RAG Engine..."):
+                    st.session_state.rag_engine = RAGEngine(
+                        groq_api_key=st.session_state.groq_api_key,
+                        pinecone_api_key=pinecone_key,
+                        pinecone_environment=pinecone_env,
+                        pinecone_index_name=pinecone_index
+                    )
+                st.success("✅ RAG Engine initialized!")
+        except Exception as e:
+            st.warning(f"⚠️ Could not initialize RAG Engine: {str(e)}")
+    
+    st.divider()
+    
     st.subheader("📄 Document Management")
     
     # PDF upload
@@ -81,7 +110,17 @@ with st.sidebar:
                         "chunk_count": len(chunks)
                     }
                     st.session_state.document_chunks.extend(chunks)
-                    st.success(f"✅ Processed {uploaded_pdf.name} ({len(chunks)} chunks)")
+                    
+                    # Index chunks in RAG engine if available
+                    if st.session_state.rag_engine:
+                        with st.spinner("Indexing chunks in Pinecone..."):
+                            success = st.session_state.rag_engine.index_documents(chunks)
+                            if success:
+                                st.success(f"✅ Processed {uploaded_pdf.name} ({len(chunks)} chunks indexed)")
+                            else:
+                                st.warning(f"⚠️ Processed {uploaded_pdf.name} but indexing failed")
+                    else:
+                        st.success(f"✅ Processed {uploaded_pdf.name} ({len(chunks)} chunks)")
                 except Exception as e:
                     st.error(f"❌ Error processing PDF: {str(e)}")
         else:
@@ -142,6 +181,11 @@ if prompt := st.chat_input("Ask me anything..."):
         st.toast("📄 Please upload a document first!", icon="📄")
         st.stop()
     
+    # Check if RAG engine is initialized
+    if not st.session_state.rag_engine:
+        st.error("❌ RAG Engine not initialized. Check your Pinecone API key in environment variables.")
+        st.stop()
+    
     # Add user message to chat history
     st.session_state.messages.append({
         "role": "user",
@@ -152,31 +196,37 @@ if prompt := st.chat_input("Ask me anything..."):
     with st.chat_message("user"):
         st.write(prompt)
     
-    # Generate response using Groq
+    # Retrieve relevant context
+    with st.spinner("🔍 Retrieving relevant documents..."):
+        retrieved_chunks = st.session_state.rag_engine.retrieve(prompt, top_k=5)
+    
+    if not retrieved_chunks:
+        st.warning("⚠️ No relevant documents found. Try rephrasing your question.")
+        st.session_state.messages.pop()  # Remove the user message
+        st.stop()
+    
+    # Generate response using streaming
     try:
-        chat = ChatGroq(
-            temperature=0.7,
-            groq_api_key=st.session_state.groq_api_key,
-            model_name="llama-3.3-70b-versatile",
-        )
-        
-        # Build messages for LLM
-        messages = []
-        for msg in st.session_state.messages:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            else:
-                messages.append(AIMessage(content=msg["content"]))
-        
-        # Get response
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             full_response = ""
             
             # Stream response
-            for chunk in chat.stream(messages):
-                full_response += chunk.content
+            for chunk in st.session_state.rag_engine.generate_response_streaming(
+                prompt, 
+                retrieved_chunks,
+                chat_history=st.session_state.messages[:-1]  # Exclude current user message
+            ):
+                full_response += chunk
                 response_placeholder.write(full_response)
+            
+            # Display source citations
+            if retrieved_chunks:
+                st.divider()
+                st.markdown("### 📚 Sources")
+                citations = st.session_state.rag_engine._extract_citations(retrieved_chunks)
+                for i, citation in enumerate(citations, 1):
+                    st.caption(f"{i}. **{citation['filename']}** (Page {citation['page']}) - Score: {citation['score']:.2%}")
         
         # Add assistant response to chat history
         st.session_state.messages.append({
@@ -185,6 +235,6 @@ if prompt := st.chat_input("Ask me anything..."):
         })
         
     except Exception as e:
-        st.error(f"❌ Error: {str(e)}")
+        st.error(f"❌ Error generating response: {str(e)}")
         # Remove the user message if there was an error
         st.session_state.messages.pop()
