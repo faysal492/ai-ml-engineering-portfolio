@@ -63,3 +63,10 @@ data/
 
 # HuggingFace Cache
 .cache/huggingface/
+
+# Documentation (exclude all .md except README.md)
+*.md
+!README.md
+
+# Text files
+*.txt
